@@ -57,12 +57,11 @@ public struct ReverseTunnelOptions: Sendable {
     }
 }
 
-public final class ReverseTunnelClient: @unchecked Sendable {
+public actor ReverseTunnelClient {
     private let options: ReverseTunnelOptions
     private let log: @Sendable (String) -> Void
     private let onStatus: @Sendable (ReverseTunnelStatus) -> Void
 
-    private let lock = NSLock()
     private var state = "off"
     private var confirmed = false
     private var attachGen: String?
@@ -75,7 +74,7 @@ public final class ReverseTunnelClient: @unchecked Sendable {
     private var receiveLoopTask: Task<Void, Never>?
     private var streams: [UInt32: StreamEntry] = [:]
 
-    private final class StreamEntry {
+    private final class StreamEntry: @unchecked Sendable {
         var connection: NWConnection?
         var pending: [Data] = []
         var closedByPeer = false
@@ -92,9 +91,7 @@ public final class ReverseTunnelClient: @unchecked Sendable {
     }
 
     public func getStatus() -> ReverseTunnelStatus {
-        lock.lock()
-        defer { lock.unlock() }
-        return ReverseTunnelStatus(
+        ReverseTunnelStatus(
             state: state,
             mode: options.mode,
             confirmed: confirmed,
@@ -107,23 +104,19 @@ public final class ReverseTunnelClient: @unchecked Sendable {
     }
 
     private func setState(_ newState: String) {
-        lock.lock()
         state = newState
-        lock.unlock()
-        onStatus(getStatus())
+        let status = getStatus()
+        onStatus(status)
     }
 
     public func start() async throws {
-        lock.lock()
         if webSocketTask != nil {
-            lock.unlock()
             throw TunnelError.alreadyStarted
         }
         stopping = false
         confirmed = false
         attachGen = nil
         lastError = nil
-        lock.unlock()
         setState("connecting")
 
         guard let url = URL(string: options.url) else {
@@ -141,18 +134,10 @@ public final class ReverseTunnelClient: @unchecked Sendable {
         let config = URLSessionConfiguration.default
         let session = URLSession(configuration: config)
         let task = session.webSocketTask(with: request)
-
-        lock.lock()
         self.session = session
         self.webSocketTask = task
-        lock.unlock()
-
         task.resume()
 
-        // Wait briefly for the socket to leave the suspended state.
-        // URLSessionWebSocketTask does not expose a clean open event; we treat
-        // successful resume + first receive loop as connected, and confirmation
-        // arrives via ping/pong or first binary frame.
         setState("connected")
         log("reverse-tunnel: attached to \(safeHost(options.url)); waiting for the box to answer")
 
@@ -160,43 +145,42 @@ public final class ReverseTunnelClient: @unchecked Sendable {
             await self?.receiveLoop()
         }
 
-        // Send a ping to elicit confirmation (mirrors Node client).
-        try? await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            task.sendPing { error in
-                if let error {
-                    cont.resume(throwing: error)
-                } else {
-                    cont.resume()
+        do {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                task.sendPing { error in
+                    if let error {
+                        cont.resume(throwing: error)
+                    } else {
+                        cont.resume()
+                    }
                 }
             }
+            markConfirmed()
+        } catch {
+            // Ping failure is non-fatal; confirmation may still arrive via frames.
+            log("reverse-tunnel: initial ping failed: \(error.localizedDescription)")
         }
-        markConfirmed()
     }
 
     public func waitForConfirm(timeoutSeconds: TimeInterval = 30) async throws {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while Date() < deadline {
-            if getStatus().confirmed { return }
+            if confirmed { return }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
-        if !getStatus().confirmed {
+        if !confirmed {
             throw TunnelError.confirmTimeout
         }
     }
 
     public func runUntilStopped() async {
-        while true {
-            lock.lock()
-            let done = stopping || webSocketTask == nil
-            lock.unlock()
-            if done { break }
+        while !stopping && webSocketTask != nil {
             try? await Task.sleep(nanoseconds: 500_000_000)
             onStatus(getStatus())
         }
     }
 
     public func stop() {
-        lock.lock()
         stopping = true
         let task = webSocketTask
         webSocketTask = nil
@@ -205,7 +189,6 @@ public final class ReverseTunnelClient: @unchecked Sendable {
         let entries = streams
         streams.removeAll()
         confirmed = false
-        lock.unlock()
 
         receiveLoopTask?.cancel()
         receiveLoopTask = nil
@@ -219,101 +202,75 @@ public final class ReverseTunnelClient: @unchecked Sendable {
     }
 
     private func markConfirmed() {
-        lock.lock()
-        let already = confirmed
-        if !already { confirmed = true }
-        lock.unlock()
-        if !already {
-            log("reverse-tunnel: the box confirmed the \(options.mode) attach")
-            onStatus(getStatus())
-        }
+        guard !confirmed else { return }
+        confirmed = true
+        log("reverse-tunnel: the box confirmed the \(options.mode) attach")
+        onStatus(getStatus())
     }
 
     private func receiveLoop() async {
         while true {
-            lock.lock()
-            let task = webSocketTask
-            let isStopping = stopping
-            lock.unlock()
-            guard let task, !isStopping else { return }
-
+            guard let task = webSocketTask, !stopping else { return }
             do {
                 let message = try await task.receive()
                 markConfirmed()
                 switch message {
                 case .data(let data):
-                    handleFrame(data)
+                    await handleFrame(data)
                 case .string:
-                    // ignore text frames
                     break
                 @unknown default:
                     break
                 }
             } catch {
-                lock.lock()
                 if lastError == nil {
                     lastError = error.localizedDescription
                 }
                 let isStopping = stopping
                 webSocketTask = nil
-                lock.unlock()
                 if !isStopping {
                     log("reverse-tunnel: socket closed: \(error.localizedDescription)")
                     setState("off")
                 }
-                for (_, entry) in snapshotStreams() {
+                for (_, entry) in streams {
                     entry.connection?.cancel()
                 }
-                clearStreams()
+                streams.removeAll()
                 return
             }
         }
     }
 
-    private func handleFrame(_ raw: Data) {
+    private func handleFrame(_ raw: Data) async {
         guard let frame = FrameCodec.decode(raw) else { return }
         switch frame {
         case .open(let streamId, let host, let port):
-            Task { await openStream(streamId: streamId, host: host, port: port) }
+            await openStream(streamId: streamId, host: host, port: port)
         case .data(let streamId, let payload):
-            lock.lock()
-            let entry = streams[streamId]
-            lock.unlock()
-            guard let entry else { return }
+            guard let entry = streams[streamId] else { return }
             if let connection = entry.connection {
                 connection.send(content: payload, completion: .contentProcessed { _ in })
             } else {
-                lock.lock()
                 entry.pending.append(payload)
-                lock.unlock()
             }
         case .close(let streamId):
-            lock.lock()
-            guard let entry = streams[streamId] else {
-                lock.unlock()
-                return
-            }
+            guard let entry = streams[streamId] else { return }
             if let connection = entry.connection {
                 streams.removeValue(forKey: streamId)
-                lock.unlock()
                 connection.cancel()
             } else {
                 entry.closedByPeer = true
-                lock.unlock()
             }
         }
     }
 
     private func openStream(streamId: UInt32, host: String, port: UInt16) async {
-        lock.lock()
         if streams[streamId] != nil {
-            lock.unlock()
             send(FrameCodec.encodeClose(streamId: streamId))
             return
         }
         let entry = StreamEntry()
         streams[streamId] = entry
-        lock.unlock()
 
         let address: String?
         if PrivateIPGate.parseIPv4(host) != nil || host.contains(":") {
@@ -323,55 +280,52 @@ public final class ReverseTunnelClient: @unchecked Sendable {
                 address = nil
             }
         } else {
-            address = await resolveHost(host)
+            address = await Self.resolveHost(host, allowPrivate: options.allowPrivateTargets)
         }
 
-        lock.lock()
         let stillOurs = streams[streamId] === entry
-        let isStopping = stopping
-        let hasWS = webSocketTask != nil
-        lock.unlock()
-
-        guard let address, stillOurs, !isStopping, hasWS else {
+        guard let address, stillOurs, !stopping, webSocketTask != nil else {
             if address == nil {
                 log("reverse-tunnel: refused stream \(streamId) (unresolvable or blocked)")
             }
-            lock.lock()
             streams.removeValue(forKey: streamId)
-            lock.unlock()
+            send(FrameCodec.encodeClose(streamId: streamId))
+            return
+        }
+
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            streams.removeValue(forKey: streamId)
             send(FrameCodec.encodeClose(streamId: streamId))
             return
         }
 
         let connection = NWConnection(
             host: NWEndpoint.Host(address),
-            port: NWEndpoint.Port(rawValue: port)!,
+            port: nwPort,
             using: .tcp
         )
-        lock.lock()
         entry.connection = connection
         relayedStreams += 1
-        lock.unlock()
         log("reverse-tunnel: relaying stream \(streamId) → \(host):\(port)")
         onStatus(getStatus())
 
-        connection.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            switch state {
-            case .failed, .cancelled:
-                self.teardownStream(streamId: streamId, connection: connection)
-            default:
-                break
+        connection.stateUpdateHandler = { [weak self] connectionState in
+            Task {
+                guard let self else { return }
+                switch connectionState {
+                case .failed, .cancelled:
+                    await self.teardownStream(streamId: streamId, connection: connection)
+                default:
+                    break
+                }
             }
         }
         connection.start(queue: .global(qos: .utility))
-        receiveFromTCP(streamId: streamId, connection: connection)
+        Self.receiveFromTCP(streamId: streamId, connection: connection, client: self)
 
-        lock.lock()
         let pending = entry.pending
         entry.pending = []
         let closedByPeer = entry.closedByPeer
-        lock.unlock()
         for chunk in pending {
             connection.send(content: chunk, completion: .contentProcessed { _ in })
         }
@@ -380,41 +334,38 @@ public final class ReverseTunnelClient: @unchecked Sendable {
         }
     }
 
-    private func receiveFromTCP(streamId: UInt32, connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            if let data, !data.isEmpty {
-                self.send(FrameCodec.encodeData(streamId: streamId, payload: data))
+    private static func receiveFromTCP(
+        streamId: UInt32,
+        connection: NWConnection,
+        client: ReverseTunnelClient
+    ) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
+            Task {
+                if let data, !data.isEmpty {
+                    await client.send(FrameCodec.encodeData(streamId: streamId, payload: data))
+                }
+                if isComplete || error != nil {
+                    await client.teardownStream(streamId: streamId, connection: connection)
+                    return
+                }
+                Self.receiveFromTCP(streamId: streamId, connection: connection, client: client)
             }
-            if isComplete || error != nil {
-                self.teardownStream(streamId: streamId, connection: connection)
-                return
-            }
-            self.receiveFromTCP(streamId: streamId, connection: connection)
         }
     }
 
     private func teardownStream(streamId: UInt32, connection: NWConnection) {
-        lock.lock()
-        guard let entry = streams[streamId], entry.connection === connection else {
-            lock.unlock()
-            return
-        }
+        guard let entry = streams[streamId], entry.connection === connection else { return }
         streams.removeValue(forKey: streamId)
-        lock.unlock()
         connection.cancel()
         send(FrameCodec.encodeClose(streamId: streamId))
         onStatus(getStatus())
     }
 
     private func send(_ data: Data) {
-        lock.lock()
-        let task = webSocketTask
-        lock.unlock()
-        task?.send(.data(data)) { _ in }
+        webSocketTask?.send(.data(data)) { _ in }
     }
 
-    private func resolveHost(_ host: String) async -> String? {
+    private static func resolveHost(_ host: String, allowPrivate: Bool) async -> String? {
         await withCheckedContinuation { cont in
             DispatchQueue.global().async {
                 var hints = addrinfo(
@@ -437,7 +388,7 @@ public final class ReverseTunnelClient: @unchecked Sendable {
                 var ptr: UnsafeMutablePointer<addrinfo>? = first
                 while let info = ptr {
                     if let addr = info.pointee.ai_addr,
-                       (info.pointee.ai_family == AF_INET || info.pointee.ai_family == AF_INET6)
+                       info.pointee.ai_family == AF_INET || info.pointee.ai_family == AF_INET6
                     {
                         var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                         if getnameinfo(
@@ -449,8 +400,8 @@ public final class ReverseTunnelClient: @unchecked Sendable {
                             0,
                             NI_NUMERICHOST
                         ) == 0 {
-                            let ip = String(cString: hostname)
-                            if self.options.allowPrivateTargets || !PrivateIPGate.isBlockedDestinationIP(ip) {
+                            let ip = String(decoding: hostname.prefix { $0 != 0 }.map(UInt8.init), as: UTF8.self)
+                            if allowPrivate || !PrivateIPGate.isBlockedDestinationIP(ip) {
                                 cont.resume(returning: ip)
                                 return
                             }
@@ -461,18 +412,6 @@ public final class ReverseTunnelClient: @unchecked Sendable {
                 cont.resume(returning: nil)
             }
         }
-    }
-
-    private func snapshotStreams() -> [UInt32: StreamEntry] {
-        lock.lock()
-        defer { lock.unlock() }
-        return streams
-    }
-
-    private func clearStreams() {
-        lock.lock()
-        streams.removeAll()
-        lock.unlock()
     }
 
     private func safeHost(_ urlString: String) -> String {
@@ -492,8 +431,10 @@ public enum TunnelError: Error, LocalizedError, Sendable {
         case .alreadyStarted: return "reverse-tunnel client already started"
         case .invalidURL(let u): return "Invalid tunnel URL: \(u)"
         case .confirmTimeout: return "Timed out waiting for box attach confirmation"
-        case .missingURLAndToken: return "Provide --url and --token (or GROKBOT_TUNNEL_URL / GROKBOT_TUNNEL_TOKEN), or allow discovery"
-        case .ensureSandBoxMissingGateway: return "EnsureSandBox did not return gatewayUrl/gatewayToken for reverse tunnel"
+        case .missingURLAndToken:
+            return "Provide --url and --token (or GROKBOT_TUNNEL_URL / GROKBOT_TUNNEL_TOKEN), or allow discovery"
+        case .ensureSandBoxMissingGateway:
+            return "EnsureSandBox did not return gatewayUrl/gatewayToken for reverse tunnel"
         }
     }
 }

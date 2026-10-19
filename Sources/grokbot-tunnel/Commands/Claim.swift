@@ -140,7 +140,7 @@ struct Claim: AsyncParsableCommand {
             try await client.start()
             try await client.waitForConfirm(timeoutSeconds: 30)
         } catch {
-            let failed = client.getStatus()
+            let failed = await client.getStatus()
             try? StateStore.save(
                 DialerState(
                     state: failed.state,
@@ -186,8 +186,10 @@ private final class StopBox: @unchecked Sendable {
         }
         stopped = true
         lock.unlock()
-        client.stop()
-        StateStore.clear(from: paths)
-        Foundation.exit(exitCode)
+        Task {
+            await client.stop()
+            StateStore.clear(from: paths)
+            Foundation.exit(exitCode)
+        }
     }
 }
