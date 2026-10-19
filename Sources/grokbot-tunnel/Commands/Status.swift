@@ -13,7 +13,12 @@ struct Status: AsyncParsableCommand {
     func run() async throws {
         let paths = resolvePaths(shared.configDir)
         let credentials = try CredentialStore.load(from: paths)
-        let identity = try? CredentialStore.loadOrCreateMachine(paths: paths, overrideMachineId: shared.machineId)
+        let identity: MachineIdentity? = {
+            if let override = shared.machineId, !override.isEmpty {
+                return MachineIdentity(machineId: override, label: ProcessInfo.processInfo.hostName)
+            }
+            return CredentialStore.loadMachine(from: paths)
+        }()
         let dialer = StateStore.load(from: paths)
         let pid = dialer?.pid ?? StateStore.readPid(from: paths)
         let alive = pid.map(StateStore.processAlive) ?? false

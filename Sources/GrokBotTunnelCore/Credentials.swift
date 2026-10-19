@@ -58,7 +58,16 @@ public enum CredentialStore: Sendable {
         }
     }
 
-    public static func loadOrCreateMachine(
+    public static func loadMachine(from paths: ConfigPaths) -> MachineIdentity? {
+        guard FileManager.default.fileExists(atPath: paths.machineURL.path),
+              let data = try? Data(contentsOf: paths.machineURL),
+              let existing = try? JSONDecoder().decode(MachineIdentity.self, from: data),
+              !existing.machineId.isEmpty
+        else { return nil }
+        return existing
+    }
+
+        public static func loadOrCreateMachine(
         paths: ConfigPaths,
         overrideMachineId: String? = nil,
         hostname: String = ProcessInfo.processInfo.hostName
